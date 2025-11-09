@@ -6,7 +6,7 @@ on:
     inputs:
       # 添加一个输入框
       tag:
-        description: '要同步的特定版本标签 (例如 v1.0.0)。留空则同步最新版。'
+        description: '同步特定版本标签 (例如 v1.0.0)。留空则同步最新版。'
         required: false
         default: '' # 默认值为空字符串
         
@@ -28,7 +28,7 @@ jobs:
         env:
           # --- 配置区域 START ---
           # !!! 请修改为你 fork 的上游仓库 (格式: 作者/仓库名)
-          UPSTREAM_REPO: "upstream-owner/upstream-repo"
+          UPSTREAM_REPO: "beck-8/subs-check"
           # --- 配置区域 END ---
           
           # 从 workflow_dispatch 的输入中获取 tag 值
