@@ -1,15 +1,15 @@
-name: Sync Release
+name: Sync All Releases
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '同步特定版本标签(例如 v1.0.0)。留空则同步最新版。'
+        description: '同步特定标签 (如 v1.4.3)。留空则同步所有版本。'
         required: false
         default: ''
         
   schedule:
-    - cron: '0 3 * * *'
+    - cron: '0 2 * * *' # 每天凌晨2点自动运行
 
 jobs:
   sync:
@@ -27,56 +27,103 @@ jobs:
           UPSTREAM_REPO: "beck-8/subs-check" 
           SPECIFIC_TAG: ${{ inputs.tag }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 阻止 gh 出现交互式提示
+          GH_PROMPT_DISABLED: true
           
         run: |
-          SYNC_TAG="" # 最终确定要同步的 tag
-          LATEST_FLAG="--latest=false" # !!! 新增：默认不设为 "Latest" !!!
+          SYNC_TAGS="" # 最终同步的 tags 列表 (空格分隔)
           
-          # 1. 判断是同步指定版本还是最新版本
-          if [ -n "$SPECIFIC_TAG" ]; then
-            echo "已指定同步版本: $SPECIFIC_TAG"
-            SYNC_TAG=$SPECIFIC_TAG
-            # 手动指定版本，我们假定它不是最新的
-            LATEST_FLAG="--latest=false"
+          # 1. 获取上游真正的 "Latest" release 标签，用于后续判断
+          echo "正在获取上游 [$UPSTREAM_REPO] 的 'Latest' 标签..."
+          # || echo "" 确保在没有 latest release 时命令也不会失败
+          LATEST_UPSTREAM_TAG=$(gh release view -R $UPSTREAM_REPO --json tagName -q .tagName || echo "")
+          
+          if [ -z "$LATEST_UPSTREAM_TAG" ]; then
+            echo "警告：无法获取上游的 'Latest' 标签。所有同步的版本都将被标记为 '非-Latest'。"
           else
-            echo "未指定版本，将获取上游 [$UPSTREAM_REPO] 的最新 Release..."
-            SYNC_TAG=$(gh release view -R $UPSTREAM_REPO --json tagName -q .tagName || echo "")
+            echo "上游 'Latest' 标签是: $LATEST_UPSTREAM_TAG"
+          fi
+
+          # 2. 判断是同步指定版本还是所有缺失版本
+          if [ -n "$SPECIFIC_TAG" ]; then
+            # --- 手动指定了 Tag ---
+            echo "已指定同步单个版本: $SPECIFIC_TAG"
             
-            if [ -z "$SYNC_TAG" ]; then
-              echo "错误：无法获取上游 Release。"
+            # 检查本地是否已存在
+            if gh release view "$SPECIFIC_TAG" >/dev/null 2>&1; then
+              echo "版本 [$SPECIFIC_TAG] 在你的仓库已存在，无需同步。"
+              exit 0
+            fi
+            SYNC_TAGS=$SPECIFIC_TAG
+
+          else
+            # --- 自动或手动留空 ---
+            echo "未指定版本，将检查所有缺失的 releases..."
+            
+            # 获取上游所有 releases 的 tag 列表 (包含 pre-releases)
+            # tr 将换行符变为空格
+            ALL_UPSTREAM_TAGS=$(gh release list -R $UPSTREAM_REPO --json tagName -q '.[].tagName' | tr '\n' ' ')
+            if [ -z "$ALL_UPSTREAM_TAGS" ]; then
+              echo "上游没有任何 releases，无需同步。"
               exit 0
             fi
             
-            echo "发现上游最新版本: $SYNC_TAG"
-            # 自动获取最新版，我们才将其设为 "Latest"
-            LATEST_FLAG="--latest=true" # !!! 修改点：自动模式下设为 true !!!
+            # 获取本地所有 releases 的 tag 列表
+            LOCAL_TAGS=$(gh release list --json tagName -q '.[].tagName' | tr '\n' ' ')
+            
+            # 找出差异（只在上游存在的 tags）
+            # 使用 comm 命令需要排序的、换行的输入
+            # comm -23: 找出在文件1中独有，且不在文件2中的行
+            MISSING_TAGS=$(comm -23 <(echo "$ALL_UPSTREAM_TAGS" | tr ' ' '\n' | sort) <(echo "$LOCAL_TAGS" | tr ' ' '\n' | sort) | tr '\n' ' ')
+            
+            if [ -z "$MISSING_TAGS" ]; then
+              echo "本地仓库已是最新，无需同步。"
+              exit 0
+            fi
+            
+            SYNC_TAGS=$MISSING_TAGS
+            echo "发现缺失的 releases: $SYNC_TAGS"
           fi
 
-          # 2. 检查这个 Tag 在你自己的仓库里是否已经存在
-          if gh release view "$SYNC_TAG" >/dev/null 2>&1; then
-            echo "版本 [$SYNC_TAG] 在你的仓库已存在，无需同步。"
-            exit 0
-          fi
+          # 3. 循环同步所有需要同步的 tags
+          for TAG in $SYNC_TAGS; do
+            echo "---"
+            echo "正在处理 Tag: $TAG"
+            
+            # 4. 判断是否应设为 "Latest"
+            LATEST_FLAG="--latest=false"
+            if [ "$TAG" == "$LATEST_UPSTREAM_TAG" ]; then
+              LATEST_FLAG="--latest=true"
+              echo "这个版本将被标记为 'Latest'。"
+            fi
 
-          echo "准备同步新版本 [$SYNC_TAG]..."
+            # 5. 下载附件
+            # 清理并创建临时目录
+            rm -rf temp_assets
+            mkdir -p temp_assets
+            echo "正在下载 [$TAG] 的附件..."
+            # || true 确保在没有附件时脚本也不会失败
+            gh release download "$TAG" -R $UPSTREAM_REPO -D temp_assets -p "*" || true
 
-          # 3. 下载上游的所有附件
-          mkdir -p temp_assets
-          gh release download "$SYNC_TAG" -R $UPSTREAM_REPO -D temp_assets -p "*" || echo "提示：该 Release [$SYNC_TAG] 可能没有附件。"
+            # 6. 获取标题和正文
+            REPO_TITLE=$(gh release view "$TAG" -R $UPSTREAM_REPO --json name -q .name)
+            REPO_BODY=$(gh release view "$TAG" -R $UPSTREAM_REPO --json body -q .body)
 
-          # 4. 获取上游的标题和正文内容
-          REPO_TITLE=$(gh release view "$SYNC_TAG" -R $UPSTREAM_REPO --json name -q .name)
-          REPO_BODY=$(gh release view "$SYNC_TAG" -R $UPSTREAM_REPO --json body -q .body)
+            # 7. 创建 Release
+            echo "正在创建 Release [$TAG] (设为 Latest: ${LATEST_FLAG})..."
+            # temp_assets/* 会自动展开所有下载的附件
+            # 如果没有附件，* 会匹配一个不存在的 "temp_assets/*" 字符串，gh 会忽略它
+            gh release create "$TAG" temp_assets/* \
+              --title "$REPO_TITLE" \
+              --notes "Synced from $UPSTREAM_REPO. Original release notes:
 
-          # 5. 在你的仓库创建同名 Release
-          echo "正在创建 Release [$SYNC_TAG] (设为 Latest: ${LATEST_FLAG})..."
+            $REPO_BODY" \
+              $LATEST_FLAG
+
+            echo "同步 [$TAG] 完成！"
+          done
           
-          # !!! 修改点：在末尾添加了 $LATEST_FLAG !!!
-          gh release create "$SYNC_TAG" temp_assets/* \
-            --title "$REPO_TITLE" \
-            --notes "Synced from $UPSTREAM_REPO. Original release notes:
-
-          $REPO_BODY" \
-            $LATEST_FLAG
-
-          echo "同步完成！版本 [$SYNC_TAG] 已发布。"
+          # 8. 最终清理
+          rm -rf temp_assets
+          echo "---"
+          echo "所有同步任务已完成。"
