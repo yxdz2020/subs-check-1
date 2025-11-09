@@ -1,0 +1,63 @@
+name: Sync Latest Release
+on:
+  workflow_dispatch: # 允许手动触发
+  schedule:
+    - cron: '0 2 * * *' # 每天凌晨3点自动运行
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # !!! 重要：授予创建 Release 的权限 !!!
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Sync Release using gh CLI
+        env:
+          # --- 配置区域 START ---
+          # 请修改为你的上游仓库地址 (格式: 作者/仓库名)
+          UPSTREAM_REPO: "beck-8/subs-check"
+          # --- 配置区域 END ---
+          
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "检查上游 [$UPSTREAM_REPO] 的最新 Release..."
+          
+          # 1. 获取上游最新 Release 的 Tag
+          LATEST_TAG=$(gh release view -R $UPSTREAM_REPO --json tagName -q .tagName || echo "")
+          if [ -z "$LATEST_TAG" ]; then
+            echo "错误：无法获取上游 Release，可能上游没有发布任何 Release。"
+            exit 0  # 不算失败，只是没东西同步
+          fi
+          echo "发现上游最新版本: $LATEST_TAG"
+
+          # 2. 检查这个 Tag 在你自己的仓库里是否已经存在
+          if gh release view "$LATEST_TAG" >/dev/null 2>&1; then
+            echo "版本 [$LATEST_TAG] 在你的仓库已存在，无需同步。"
+            exit 0
+          fi
+
+          echo "准备同步新版本 [$LATEST_TAG]..."
+
+          # 3. 下载上游的所有附件 (Assets) 到临时目录
+          mkdir -p temp_assets
+          # 尝试下载附件，如果没有附件可能会报错，所以加了 || true 忽略错误继续执行
+          gh release download "$LATEST_TAG" -R $UPSTREAM_REPO -D temp_assets -p "*" || echo "提示：该 Release 可能没有附件，仅同步文字内容。"
+
+          # 4. 获取上游的标题和正文内容
+          REPO_TITLE=$(gh release view "$LATEST_TAG" -R $UPSTREAM_REPO --json name -q .name)
+          REPO_BODY=$(gh release view "$LATEST_TAG" -R $UPSTREAM_REPO --json body -q .body)
+
+          # 5. 在你的仓库创建同名 Release 并上传附件
+          # 注意：这里默认关联到你当前仓库的默认分支（通常是 main 或 master）
+          # 如果你想让 tag 指向特定的提交，可能需要更复杂的设置，但通常这就够用了。
+          echo "正在创建 Release..."
+          gh release create "$LATEST_TAG" temp_assets/* \
+            --title "$REPO_TITLE" \
+            --notes "Synced from $UPSTREAM_REPO. Original release notes:
+
+          $REPO_BODY"
+
+          echo "同步完成！版本 [$LATEST_TAG] 已发布。"
