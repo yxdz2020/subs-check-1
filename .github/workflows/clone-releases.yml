@@ -8,51 +8,75 @@ on:
 # ----------------------------------------------------
 # ⚠️!! 请在这里修改上游仓库的路径 !!
 env:
-  UPSTREAM_REPO: 'beck-8/subs-check' # 确认这里是 'beck-8/subs-check'
+  UPSTREAM_REPO: 'beck-8/subs-check'
 # ----------------------------------------------------
 
 jobs:
-  # --- 作业 1: 检查有哪些 Releases 缺失 ---
+  # --- 作业 1: 检查有哪些 Releases 缺失或已过期 ---
   check:
     runs-on: ubuntu-latest
     outputs:
-      missing_tags: ${{ steps.check_tags.outputs.MISSING_TAGS }}
+      tags_to_sync: ${{ steps.check_tags.outputs.TAGS_TO_SYNC }}
 
     steps:
-      - name: 1. 检查缺失的 Release 标签 (按顺序)
+      - name: 1. 智能检查 Releases (新增 & 修改)
         id: check_tags
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OWN_REPO: ${{ github.repository }}
         run: |
           echo "Fetching releases from upstream: $UPSTREAM_REPO"
-          gh release list --repo $UPSTREAM_REPO --limit 100 --json tagName --jq '.[] | .tagName' > upstream_tags_raw.txt
+          # 1. 获取上游所有 releases (带 tag 和 updatedAt 时间戳)
+          # ⚠️ 限制提高到 300
+          gh release list --repo $UPSTREAM_REPO --limit 300 \
+            --json tagName,updatedAt > upstream_releases.json
           
           echo "Fetching releases from own repo: $OWN_REPO"
-          gh release list --repo $OWN_REPO --limit 100 --json tagName --jq '.[] | .tagName' > own_tags.txt
+          # 2. 获取自己的所有 releases (带 tag 和 body, 用于提取时间戳)
+          gh release list --repo $OWN_REPO --limit 300 \
+            --json tagName,body > own_releases.json
 
-          sort -V upstream_tags_raw.txt > upstream_tags.txt
+          # 3. 使用 jq 进行智能比较
+          # 最终输出一个纯文本列表，包含所有 "新增" 或 "已修改" 的 tag
+          jq -r '
+            # 将 'own' 列表读入一个变量 $own, 以 tagName 为 key
+            (reduce .own[] as $item ({}; .[$item.tagName] = $item.body)) as $own_lookup
+            | .upstream[]
+            | . as $up
+            | $up.tagName as $tag
+            # 检查 'own' 仓库是否有这个 tag
+            | ($own_lookup | has($tag)) as $exists
+            | if $exists then
+                # 提取我们自己存储的时间戳
+                ($own_lookup[$tag] | match("") | .captures[0].string) as $stored_ts
+                # 如果上游时间戳 vs 存储的时间戳不一致，则输出
+                | if $up.updatedAt != $stored_ts then $tag else empty end
+              else
+                # 如果 'own' 仓库没有这个 tag, 则是新增，输出
+                $tag
+              end
+          ' --argfile upstream upstream_releases.json --argfile own own_releases.json > tags_to_sync_raw.txt
 
-          echo "Comparing tags..."
-          comm -23 upstream_tags.txt <(sort -V own_tags.txt) > missing_tags.txt
+          # 4. 按版本号排序 (确保 'sync' 作业按顺序执行)
+          sort -V tags_to_sync_raw.txt > tags_to_sync.txt
 
-          if [ ! -s missing_tags.txt ]; then
+          if [ ! -s tags_to_sync.txt ]; then
             echo "✅ Releases are already in sync."
-            echo "MISSING_TAGS=''" >> $GITHUB_OUTPUT
+            echo "TAGS_TO_SYNC=''" >> $GITHUB_OUTPUT
           else
-            echo "🔔 Found missing tags (oldest to newest):"
-            cat missing_tags.txt
+            echo "🔔 Found tags to sync (new or modified):"
+            cat tags_to_sync.txt
             {
-              echo 'MISSING_TAGS<<EOF'
-              cat missing_tags.txt
+              echo 'TAGS_TO_SYNC<<EOF'
+              cat tags_to_sync.txt
               echo 'EOF'
             } >> $GITHUB_OUTPUT
           fi
 
-  # --- 作业 2: 同步缺失的 Releases (按顺序) ---
+  # --- 作业 2: 同步缺失/过期的 Releases ---
   sync:
     needs: check
-    if: needs.check.outputs.missing_tags != ''
+    if: needs.check.outputs.tags_to_sync != ''
 
     runs-on: ubuntu-latest
     permissions:
@@ -63,7 +87,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OWN_REPO: ${{ github.repository }}
-          TAG_LIST: ${{ needs.check.outputs.missing_tags }}
+          TAG_LIST: ${{ needs.check.outputs.tags_to_sync }}
         run: |
           echo "$TAG_LIST" | while read TAG_TO_SYNC; do
             if [ -z "$TAG_TO_SYNC" ]; then continue; fi
@@ -71,31 +95,34 @@ jobs:
             echo "================================================="
             echo "Syncing release for tag: $TAG_TO_SYNC"
             
-            # --- 步骤 2.1: 获取上游 Release 详细信息 ---
+            # --- 步骤 2.1: (重要!) 先删除本地已有的版本 ---
+            echo "--- Deleting local release (if exists) to prevent conflicts ---"
+            # "gh release delete" 会同时删除 Release 和 Tag
+            # "|| true" 确保在删除一个不存在的 (新增) release 时不会报错
+            gh release delete $TAG_TO_SYNC --repo $OWN_REPO --yes || true
+            
+            # --- 步骤 2.2: 获取上游 Release 详细信息 ---
             echo "--- Fetching release metadata from $UPSTREAM_REPO ---"
+            # 抓取所有需要的信息，包括 'updatedAt'
             if ! gh release view $TAG_TO_SYNC --repo $UPSTREAM_REPO \
-              --json name,body,isPrerelease,targetCommitish > release_details.json; then
-              
-                echo "⚠️ ERROR: 无法获取 $TAG_TO_SYNC 的详情。"
-                echo "这可能是一个 '草稿' (Draft) 或已损坏的 Release。正在跳过..."
+              --json name,body,isPrerelease,targetCommitish,updatedAt > release_details.json; then
+                echo "⚠️ ERROR: 无法获取 $TAG_TO_SYNC 的详情。正在跳过..."
                 continue
             fi
 
-            # --- 步骤 2.2: 准备 gh 命令的参数 ---
+            # --- 步骤 2.3: 准备 gh 命令的参数 ---
             TITLE=$(jq -r .name release_details.json)
             NOTES_FILE="notes.txt"
-
-            # ----------------------------------------------------
-            # ⚠️!! 这就是你要求的修改 !!
-            # vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
-            # 1. 先写入 "Synced from" (使用 > 创建文件)
-            #    (添加了两个换行 \n\n 以便和 changelog 分隔开)
+            
+            # 1. 先写入 "Synced from"
             echo -e "Synced from https://github.com/$UPSTREAM_REPO\n\n" > $NOTES_FILE
             
-            # 2. 再追加 (使用 >>) 上游的原始 body
+            # 2. 再追加上游的原始 body
             jq -r .body release_details.json >> $NOTES_FILE
-            # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-            # ----------------------------------------------------
+
+            # 3. (关键!) 写入隐藏的时间戳注释
+            UPSTREAM_TS=$(jq -r .updatedAt release_details.json)
+            echo -e "\n\n" >> $NOTES_FILE
 
             IS_PRERELEASE=$(jq .isPrerelease release_details.json)
             TARGET_SHA=$(jq -r .targetCommitish release_details.json)
@@ -105,7 +132,7 @@ jobs:
               EXTRA_ARGS="--prerelease"
             fi
 
-            # --- 步骤 2.3: 在当前仓库创建 Release (仅元数据) ---
+            # --- 步骤 2.4: 在当前仓库创建 Release (仅元数据) ---
             echo "--- Creating release metadata in $OWN_REPO ---"
             gh release create $TAG_TO_SYNC \
               --repo $OWN_REPO \
@@ -116,12 +143,12 @@ jobs:
 
             echo "--- Created metadata for release: $TAG_TO_SYNC"
 
-            # --- 步骤 2.4: 下载上游 Release 的所有附件 ---
+            # --- 步骤 2.5: 下载上游 Release 的所有附件 ---
             echo "--- Downloading assets from $UPSTREAM_REPO ---"
             mkdir -p ./temp_assets
             gh release download $TAG_TO_SYNC --repo $UPSTREAM_REPO --dir ./temp_assets
 
-            # --- 步骤 2.5: 上传附件到新创建的 Release ---
+            # --- 步骤 2.6: 上传附件到新创建的 Release ---
             if [ -z "$(ls -A ./temp_assets)" ]; then
                echo "No assets found for this release."
             else
