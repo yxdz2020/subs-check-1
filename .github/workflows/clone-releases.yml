@@ -7,7 +7,6 @@ on:
 
 # ----------------------------------------------------
 # ⚠️!! 请在这里修改上游仓库的路径 !!
-# 看起来你换了仓库，请确保这里填写的是 subs-check 的上游
 env:
   UPSTREAM_REPO: 'beck-8/subs-check'
 # ----------------------------------------------------
@@ -27,17 +26,14 @@ jobs:
           OWN_REPO: ${{ github.repository }}
         run: |
           echo "Fetching releases from upstream: $UPSTREAM_REPO"
-          # 提高 limit 确保能抓取所有 releases (比如 77 个)
           gh release list --repo $UPSTREAM_REPO --limit 100 --json tagName --jq '.[] | .tagName' > upstream_tags_raw.txt
           
           echo "Fetching releases from own repo: $OWN_REPO"
           gh release list --repo $OWN_REPO --limit 100 --json tagName --jq '.[] | .tagName' > own_tags.txt
 
-          # 使用 'sort -V' 按版本号正确排序
           sort -V upstream_tags_raw.txt > upstream_tags.txt
 
           echo "Comparing tags..."
-          # comm 会输出只在上游、且已排序的列表 (从旧到新)
           comm -23 upstream_tags.txt <(sort -V own_tags.txt) > missing_tags.txt
 
           if [ ! -s missing_tags.txt ]; then
@@ -69,7 +65,6 @@ jobs:
           OWN_REPO: ${{ github.repository }}
           TAG_LIST: ${{ needs.check.outputs.missing_tags }}
         run: |
-          # 逐行读取 TAG_LIST，这会保持 'check' 作业中排序的顺序
           echo "$TAG_LIST" | while read TAG_TO_SYNC; do
             if [ -z "$TAG_TO_SYNC" ]; then continue; fi
 
@@ -78,15 +73,28 @@ jobs:
             
             # --- 步骤 2.1: 获取上游 Release 详细信息 ---
             echo "--- Fetching release metadata from $UPSTREAM_REPO ---"
-            gh release view $TAG_TO_SYNC --repo $UPSTREAM_REPO \
-              --json name,body,isPrerelease,targetCommitish > release_details.json
+            
+            # ----------------------------------------------------
+            # ⚠️!! 这就是修正的地方 (健壮性) !!
+            # vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+            # 使用 'if ! ...' 来捕获错误
+            # 如果 'gh release view' 失败 (例如 "not found")
+            if ! gh release view $TAG_TO_SYNC --repo $UPSTREAM_REPO \
+              --json name,body,isPrerelease,targetCommitish > release_details.json; then
+              
+                echo "⚠️ ERROR: 无法获取 $TAG_TO_SYNC 的详情。"
+                echo "这可能是一个 '草稿' (Draft) 或已损坏的 Release。正在跳过..."
+                # 'continue' 会跳过这个 tag，并开始循环的下一次
+                continue
+            fi
+            # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            # ----------------------------------------------------
 
             # --- 步骤 2.2: 准备 gh 命令的参数 ---
             TITLE=$(jq -r .name release_details.json)
             NOTES_FILE="notes.txt"
             jq -r .body release_details.json > $NOTES_FILE
             
-            # 删除了 '---' 黑线，只保留换行和 "Synced from"
             echo -e "\n\nSynced from https://github.com/$UPSTREAM_REPO" >> $NOTES_FILE
 
             IS_PRERELEASE=$(jq .isPrerelease release_details.json)
@@ -113,7 +121,7 @@ jobs:
             mkdir -p ./temp_assets
             gh release download $TAG_TO_SYNC --repo $UPSTREAM_REPO --dir ./temp_assets
 
-            # --- 步骤 2.5: 上传附件到新创建的 Release ---
+            # --- P步骤 2.5: 上传附件到新创建的 Release ---
             if [ -z "$(ls -A ./temp_assets)" ]; then
                echo "No assets found for this release."
             else
@@ -126,19 +134,14 @@ jobs:
             rm -rf ./temp_assets
           done # 循环结束
 
-  # ----------------------------------------------------
-  # ⚠️!! 新增的作业 3：修复 "Latest" 标签 !!
-  # ----------------------------------------------------
+  # --- 作业 3：修复 "Latest" 标签 ---
   fix_latest:
-    # 必须在 'sync' 作业完成后运行
     needs: sync
-    # 'always()' 确保无论 'sync' 是否运行 (比如没有缺失标签时)，
-    # 'fix_latest' 都会运行，以确保 "Latest" 标签始终正确
     if: always() 
     
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 需要写入权限来编辑 Release
+      contents: write
       
     steps:
       - name: 3. 修正 "Latest" 标签
@@ -147,8 +150,6 @@ jobs:
           OWN_REPO: ${{ github.repository }}
         run: |
           echo "Checking upstream for 'Latest' release..."
-          # 1. 获取上游仓库 'Latest' 版本的标签名 (例如 'v2.1.7')
-          # 'gh release list --limit 1' 总是会返回被标记为 'Latest' 的那一个
           LATEST_TAG=$(gh release list --repo $UPSTREAM_REPO --limit 1 --json tagName --jq '.[0].tagName')
           
           if [ -z "$LATEST_TAG" ]; then
@@ -158,8 +159,13 @@ jobs:
           
           echo "Upstream 'Latest' tag is: $LATEST_TAG"
           
-          # 2. 在我们自己的仓库，编辑对应的 release，强制将其设为 'Latest'
           echo "Setting '$LATEST_TAG' as 'Latest' on $OWN_REPO"
+          # 检查我们自己的仓库是否已成功同步这个 tag
+          if ! gh release view $LATEST_TAG --repo $OWN_REPO > /dev/null; then
+            echo "⚠️ ERROR: 'Latest' tag ($LATEST_TAG) was not successfully synced to $OWN_REPO. Skipping 'latest' update."
+            exit 0
+          fi
+
           gh release edit $LATEST_TAG --repo $OWN_REPO --latest
           
           echo "✅ 'Latest' tag successfully set to $LATEST_TAG."
