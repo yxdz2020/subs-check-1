@@ -8,7 +8,7 @@ on:
 # ----------------------------------------------------
 # ⚠️!! 请在这里修改上游仓库的路径 !!
 env:
-  UPSTREAM_REPO: 'beck-8/subs-check'
+  UPSTREAM_REPO: 'beck-8/subs-check' # 确认这里是 'beck-8/subs-check'
 # ----------------------------------------------------
 
 jobs:
@@ -73,29 +73,29 @@ jobs:
             
             # --- 步骤 2.1: 获取上游 Release 详细信息 ---
             echo "--- Fetching release metadata from $UPSTREAM_REPO ---"
-            
-            # ----------------------------------------------------
-            # ⚠️!! 这就是修正的地方 (健壮性) !!
-            # vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
-            # 使用 'if ! ...' 来捕获错误
-            # 如果 'gh release view' 失败 (例如 "not found")
             if ! gh release view $TAG_TO_SYNC --repo $UPSTREAM_REPO \
               --json name,body,isPrerelease,targetCommitish > release_details.json; then
               
                 echo "⚠️ ERROR: 无法获取 $TAG_TO_SYNC 的详情。"
                 echo "这可能是一个 '草稿' (Draft) 或已损坏的 Release。正在跳过..."
-                # 'continue' 会跳过这个 tag，并开始循环的下一次
                 continue
             fi
-            # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-            # ----------------------------------------------------
 
             # --- 步骤 2.2: 准备 gh 命令的参数 ---
             TITLE=$(jq -r .name release_details.json)
             NOTES_FILE="notes.txt"
-            jq -r .body release_details.json > $NOTES_FILE
+
+            # ----------------------------------------------------
+            # ⚠️!! 这就是你要求的修改 !!
+            # vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+            # 1. 先写入 "Synced from" (使用 > 创建文件)
+            #    (添加了两个换行 \n\n 以便和 changelog 分隔开)
+            echo -e "Synced from https://github.com/$UPSTREAM_REPO\n\n" > $NOTES_FILE
             
-            echo -e "\n\nSynced from https://github.com/$UPSTREAM_REPO" >> $NOTES_FILE
+            # 2. 再追加 (使用 >>) 上游的原始 body
+            jq -r .body release_details.json >> $NOTES_FILE
+            # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            # ----------------------------------------------------
 
             IS_PRERELEASE=$(jq .isPrerelease release_details.json)
             TARGET_SHA=$(jq -r .targetCommitish release_details.json)
@@ -121,7 +121,7 @@ jobs:
             mkdir -p ./temp_assets
             gh release download $TAG_TO_SYNC --repo $UPSTREAM_REPO --dir ./temp_assets
 
-            # --- P步骤 2.5: 上传附件到新创建的 Release ---
+            # --- 步骤 2.5: 上传附件到新创建的 Release ---
             if [ -z "$(ls -A ./temp_assets)" ]; then
                echo "No assets found for this release."
             else
@@ -160,7 +160,6 @@ jobs:
           echo "Upstream 'Latest' tag is: $LATEST_TAG"
           
           echo "Setting '$LATEST_TAG' as 'Latest' on $OWN_REPO"
-          # 检查我们自己的仓库是否已成功同步这个 tag
           if ! gh release view $LATEST_TAG --repo $OWN_REPO > /dev/null; then
             echo "⚠️ ERROR: 'Latest' tag ($LATEST_TAG) was not successfully synced to $OWN_REPO. Skipping 'latest' update."
             exit 0
