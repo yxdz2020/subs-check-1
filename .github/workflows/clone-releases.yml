@@ -6,7 +6,7 @@ on:
     - cron: '0 3 * * *'
 
 # ----------------------------------------------------
-# ⚠️!! 请在这里修改上游仓库的路径 !!
+# ⚠️!! 上游仓库地址 !!
 env:
   UPSTREAM_REPO: 'beck-8/subs-check'
 # ----------------------------------------------------
@@ -26,16 +26,16 @@ jobs:
           OWN_REPO: ${{ github.repository }}
         run: |
           echo "Fetching releases from upstream: $UPSTREAM_REPO"
-          # ⚠️ 限制提高到 300
           gh release list --repo $UPSTREAM_REPO --limit 300 --json tagName --jq '.[] | .tagName' > upstream_tags_raw.txt
           
           echo "Fetching releases from own repo: $OWN_REPO"
           gh release list --repo $OWN_REPO --limit 300 --json tagName --jq '.[] | .tagName' > own_tags.txt
 
-          sort -V upstream_tags_raw.txt > upstream_tags.txt
+          # 使用 'sort' (非 'sort -V') 来兼容 'comm'
+          sort upstream_tags_raw.txt > upstream_tags.txt
 
           echo "Comparing tags..."
-          comm -23 upstream_tags.txt <(sort -V own_tags.txt) > missing_tags.txt
+          comm -23 upstream_tags.txt <(sort own_tags.txt) > missing_tags.txt
 
           if [ ! -s missing_tags.txt ]; then
             echo "✅ Releases are already in sync."
@@ -86,10 +86,7 @@ jobs:
             TITLE=$(jq -r .name release_details.json)
             NOTES_FILE="notes.txt"
 
-            # 1. 先写入 "Synced from"
             echo -e "Synced from https://github.com/$UPSTREAM_REPO\n\n" > $NOTES_FILE
-            
-            # 2. 再追加上游的原始 body
             jq -r .body release_details.json >> $NOTES_FILE
 
             IS_PRERELEASE=$(jq .isPrerelease release_details.json)
@@ -114,14 +111,21 @@ jobs:
             # --- 步骤 2.4: 下载上游 Release 的所有附件 ---
             echo "--- Downloading assets from $UPSTREAM_REPO ---"
             mkdir -p ./temp_assets
-            gh release download $TAG_TO_SYNC --repo $UPSTREAM_REPO --dir ./temp_assets
+            
+            # ----------------------------------------------------
+            # ⚠️!! 这就是修正的地方 !!
+            # vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+            # 添加 '|| true' 允许此命令在 "没有附件" 时失败而不使脚本崩溃
+            gh release download $TAG_TO_SYNC --repo $UPSTREAM_REPO --dir ./temp_assets || true
+            # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            # ----------------------------------------------------
 
             # --- 步骤 2.5: 上传附件到新创建的 Release ---
             if [ -z "$(ls -A ./temp_assets)" ]; then
-               echo "No assets found for this release."
+               echo "No assets to download"
             else
                echo "--- Uploading assets to $OWN_REPO ---"
-               gh release upload $TAG_TO_SYNC --repo $OWN_REPO --clber ./temp_assets/*
+               gh release upload $TAG_TO_SYNC --repo $OWN_REPO --clobber ./temp_assets/*
                echo "✅ Synced release with assets: $TAG_TO_SYNC"
             fi
             
