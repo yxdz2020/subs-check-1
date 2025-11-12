@@ -1,0 +1,33 @@
+name: RepoSync
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # 每天 0 点 (UTC)
+  workflow_dispatch:
+
+jobs:
+  sync_latest_from_upstream:
+    name: 自动同步上游仓库
+    runs-on: ubuntu-latest
+    
+    env:
+      UPSTREAM_REPO: 'beck-8/subs-check'  # 定义上游仓库，格式为“用户名/仓库名”
+      UPSTREAM_BRANCH: 'master'  # 定义上游仓库的分支
+      TARGET_BRANCH: 'master'  # 定义目标仓库的分支
+
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+
+      - name: Sync upstream changes
+        id: sync
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          upstream_sync_repo: ${{ env.UPSTREAM_REPO }}  # 定义上游仓库
+          upstream_sync_branch: ${{ env.UPSTREAM_BRANCH }}  # 定义上游仓库的分支
+          target_sync_branch: ${{ env.TARGET_BRANCH }}  # 定义目标仓库的分支
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}  # 自动生成，无需设置
+          test_mode: false  # 关闭测试模式，实际执行同步操作
