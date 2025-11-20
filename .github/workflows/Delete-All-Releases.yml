@@ -1,0 +1,49 @@
+name: Delete All Releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: '输入 DELETE 确认删除所有 releases'
+        required: true
+        type: string
+
+jobs:
+  delete-releases:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'DELETE'
+    permissions:
+      contents: write
+    
+    steps:
+    - name: 删除 releases
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "🚨 开始删除所有 releases..."
+        total=0
+        
+        # 安装 GitHub CLI
+        curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+        sudo apt update && sudo apt install gh -y
+        
+        # 使用 GitHub CLI 删除
+        echo "$GH_TOKEN" | gh auth login --with-token
+        
+        releases=$(gh release list --repo ${{ github.repository }} --limit 1000 -q '.[].tag_name' 2>/dev/null || true)
+        
+        if [ -z "$releases" ]; then
+          echo "✅ 没有找到 releases"
+          exit 0
+        fi
+        
+        echo "📋 找到 $(echo "$releases" | wc -l) 个 releases"
+        
+        for tag in $releases; do
+          echo "🗑️  删除: $tag"
+          gh release delete "$tag" --repo ${{ github.repository }} --yes || true
+          total=$((total + 1))
+        done
+        
+        echo "🎉 删除完成! 总计: $total 个 releases"
